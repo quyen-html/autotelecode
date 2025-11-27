@@ -1,0 +1,171 @@
+1. Giới thiệu
+Multi Social Manager (MSM) là nền tảng SaaS hỗ trợ quản lý nhiều tài khoản mạng xã hội tại một nơi. Giai đoạn đầu, hệ thống tập trung vào Telegram, cung cấp các tính năng:
+•	Gửi tin nhắn tự động
+•	Đọc tin nhắn
+•	Quản lý nhiều tài khoản Telegram
+•	Lưu log & quản lý job thực thi
+Hệ thống backend được thiết kế theo mô hình modular service, đảm bảo:
+•	Dễ mở rộng (scalable)
+•	Chạy đa worker
+•	Tách biệt API & worker
+•	An toàn & chịu tải cao
+2. Kiến trúc tổng quan
+Hệ thống bao gồm các thành phần chính:
+Component	Ngôn ngữ / Công nghệ	Vai trò
+Backend API:	Go(Gin/Echo/Fiber)	Xử lý API, auth, tạo job vào queue
+PostgreSQL:	RDBMS, Queue System	Lưu user, account, proxy, log, jobs, Xử lý job không đồng bộ
+		
+Worker Telegram:	Go	Gửi tin, gửi tin hàng loạt theo danh sách trong database, đọc tin, đồng bộ trạng thái
+Dashboard:	Next.js	UI người dùng
+2.1 Mô hình luồng xử lý (E2E)
+User → Dashboard → Backend API → DB Queue → Worker → Telegram → DB → API → UI
+3. Backend API (Go)
+3.1 Nhiệm vụ chính
+•	Cung cấp API REST cho Dashboard.
+•	Quản lý tài khoản người dùng.
+•	Quản lý tài khoản Telegram.
+•	Tạo job gửi tin / đọc tin.
+•	Truy vấn log & kết quả job.
+•	Là gateway chính cho toàn bộ hệ thống.
+3.3 Các mô-đun chính trong Backend
+•	Module Auth (JWT / Session)
+•	Module Telegram Accounts
+•	Module Job Manager 
+•	Module Log/Report
+3.4 Giao tiếp với Queue 
+Backend chỉ đảm nhiệm:
+•	Validate input
+•	Insert job vào db
+
+4. Queue System 
+4.1 Task Types
+Task	Description
+telegram:send_message, send_message_bylist	Gửi tin nhắn
+telegram:fetch_messages	Đọc tin nhắn
+telegram:update_status	Đồng bộ trạng thái
+4.2 Lợi ích
+•	Tăng khả năng chịu tải
+•	Retry tự động
+•	Delay job
+•	Worker scale ngang
+5. Worker Telegram
+Worker là service tách biệt hoàn toàn với Backend.
+5.1	Chức năng
+•	Nhận job từ DB, nếu tài khoản chưa hoạt động thì Load tài khoản Telegram + session ,Mở Telegram client
+•	Thực thi job
+•	Trả kết quả → DB
+•	Có lưu các trạng thái và lưu trạng thái vào db theo thời gian thực kiểu như:
+Trạng thái mong muốn	TDLib mô tả qua	Ý nghĩa
+Chưa chạy	authorizationStateClosed	Chưa khởi động TDLib
+Đang chạy nhưng chưa kết nối mạng	connectionStateWaitingForNetwork	Không có Internet
+Đang kết nối server	connectionStateConnecting	Kết nối DC
+Đã kết nối server nhưng chưa login	connectionStateReady + authorizationStateWaitPhoneNumber	Online, chưa đăng nhập
+Đang đăng nhập	authorizationStateWaitCode / WaitPassword	Nhập OTP hoặc 2FA
+Đang hoạt động	connectionStateReady + authorizationStateReady	FULLY ONLINE
+Mất kết nối	connectionStateWaitingForNetwork	Mất mạng
+Đang tắt	connectionStateShutdown	Kết thúc client
+
+5.2 Tính chất Worker
+•	Stateless (mọi thứ load từ DB)
+•	Scale không giới hạn
+•	Không ảnh hưởng API
+7. PostgreSQL Database(máy chủ riêng)
+7.1 Thiết kế bảng
+Bảng users
+id UUID PK
+email TEXT UNIQUE
+password_hash TEXT
+created_at TIMESTAMP
+Bảng telegram_accounts
+id UUID PK
+user_id UUID FK
+phone_number TEXT
+session_data BYTEA
+status TEXT
+last_sync TIMESTAMP
+created_at TIMESTAMP
+Bảng jobs
+id UUID PK
+account_id UUID FK
+type TEXT
+payload JSONB
+queue_id TEXT
+status TEXT
+created_at TIMESTAMP
+finished_at TIMESTAMP
+Bảng messages_log
+id UUID PK
+account_id UUID FK
+direction TEXT (incoming/outgoing)
+content TEXT
+raw JSONB
+created_at TIMESTAMP
+7.2 Index tối ưu
+•	telegram_accounts(user_id)
+•	messages_log(account_id)
+•	jobs(account_id)
+•	jobs(status)
+8. Dashboard Frontend
+Framework đề xuất: Next.js (App Router)
+8.1 Chức năng
+•	Login
+•	CRUD tài khoản Telegram
+•	Form gửi tin
+•	Nhật ký job
+•	Log tin nhắn
+•	Bảng điều khiển real-time
+8.2 Kết nối Backend
+•	Qua REST API
+•	Công nghệ đề xuất: SWR / React Query
+10. End-to-End Flow Chi Tiết
+10.1 Flow: Gửi tin
+1. User → Dashboard → Backend API
+POST /telegram/send_message_bylist
+2. Backend tạo job
+•	Validate account
+•	Push task vào queue DB
+3. Worker nhận job Load session
+•	Thực hiện job
+4. Worker lưu log vào DB
+•	messages_log
+•	jobs.status = done
+5. Dashboard lấy dữ liệu từ API
+________________________________________
+10.2 Flow: Đọc tin
+Cron job mỗi 15–30 giây
+Backend tạo job telegram:fetch_messages
+Worker:
+•	Load session
+•	Fetch unread messages
+•	Lưu vào DB
+Dashboard đọc log → hiển thị tin nhắn mới.
+11. Kế hoạch triển khai theo giai đoạn
+Giai đoạn 1 – MVP (Telegram Worker cơ bản)
+•	Backend API (login, add account, send message)
+•	Worker send message
+•	DB: user + account 
+•	Dashboard UI cơ bản
+Giai đoạn 2 – Hoàn chỉnh Telegram
+•	Worker đọc tin
+•	Log tin nhắn
+•	UI đầy đủ
+
+Giai đoạn 3 – Tối ưu & Scale
+•	Tách worker thành nhiều instance
+•	Docker Compose → Kubernetes
+Giai đoạn 4 – Mở rộng sang các nền tảng khác
+•	Meta/Facebook
+•	WhatsApp
+•	Instagram DM
+•	TikTok messages
+15. Kết luận
+Tài liệu này mô tả toàn bộ kiến trúc server-side của hệ thống Multi Social Manager, bao gồm:
+•	Backend API
+•	Worker hệ thống
+•	Queue
+•	Database
+•	Quản lý log
+•	Luồng hoạt động end-to-end
+•	Kế hoạch triển khai theo roadmap
+Hệ thống đủ khả năng mở rộng, chạy 24/7, thêm nhiều nền tảng mới.
+
